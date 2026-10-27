@@ -1,0 +1,224 @@
+name: Release desktop apps
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      commit: ${{ steps.checkout.outputs.commit }}
+    steps:
+      - name: Check out the release commit
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Require a SemVer tag matching package.json
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const version = require('./package.json').version;
+          const lock = require('./package-lock.json');
+          const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/;
+          const match = typeof version === 'string' && version.match(semver);
+          if (!match || process.env.RELEASE_TAG !== 'v' + version) {
+            throw new Error('Release tag must be a valid SemVer and exactly match v' + version);
+          }
+          if (lock.version !== version || lock.packages?.['']?.version !== version) {
+            throw new Error('package-lock.json and its root package version must match package.json.');
+          }
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, 'version=' + version + '\nprerelease=' + Boolean(match[4]) + '\n');
+          NODE
+
+  build:
+    name: Build release (${{ matrix.platform }})
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: mac
+            extension: zip
+          - os: windows-latest
+            platform: win
+            extension: exe
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - name: Check out the validated commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Check syntax and run unit and Git integration tests
+        run: npm run verify
+      - name: Smoke test the desktop application
+        run: npm run test:desktop
+      - name: Build macOS ARM64 and Intel distributions
+        if: runner.os == 'macOS'
+        run: npm run dist:mac -- --publish never
+      - name: Build the Windows x64 installer
+        if: runner.os == 'Windows'
+        run: npm run dist:win -- --publish never
+      - name: Smoke test the native packaged application
+        run: npm run test:packaged
+      - name: Upload verified distributions
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ matrix.platform }}
+          path: release/Repo-Tray-${{ needs.validate.outputs.version }}-${{ matrix.platform }}-*.${{ matrix.extension }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          overwrite: true
+
+  publish:
+    name: Publish the complete GitHub release
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+      RELEASE_PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+    steps:
+      - name: Check out the validated commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Download macOS distributions
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-mac
+          path: release/assets
+          digest-mismatch: error
+      - name: Download the Windows distribution
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-win
+          path: release/assets
+          digest-mismatch: error
+      - name: Validate all three binaries and generate SHA-256 checksums
+        run: node scripts/prepare-release.cjs release/assets "$RELEASE_TAG"
+      - name: Create or resume a draft, verify its assets, then publish
+        run: |
+          set -euo pipefail
+          marker="<!-- repo-tray-release:$RELEASE_TAG:$RELEASE_COMMIT -->"
+          notes="release/release-notes.md"
+          if [[ -f "docs/releases/$RELEASE_VERSION.md" ]]; then
+            cp "docs/releases/$RELEASE_VERSION.md" "$notes"
+          else
+            gh api --method POST "repos/$GH_REPO/releases/generate-notes" \
+              -f tag_name="$RELEASE_TAG" -f target_commitish="$RELEASE_COMMIT" \
+              --jq '.body' > "$notes"
+          fi
+          printf '\n\n%s\n' "$marker" >> "$notes"
+
+          if gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > release/existing-release.json 2> release/release-query-error.txt; then
+            node <<'NODE'
+          const fs = require('node:fs');
+          const release = JSON.parse(fs.readFileSync('release/existing-release.json', 'utf8'));
+          const marker = '<!-- repo-tray-release:' + process.env.RELEASE_TAG + ':' + process.env.RELEASE_COMMIT + ' -->';
+          const expected = new Set(fs.readdirSync('release/assets'));
+          if (release.tag_name !== process.env.RELEASE_TAG || !release.draft) {
+            throw new Error('An existing public release will not be overwritten.');
+          }
+          if (!release.body?.includes(marker)) {
+            throw new Error('This draft was not created by this workflow for the same tag and commit.');
+          }
+          if (release.assets.some(asset => !expected.has(asset.name))) {
+            throw new Error('The draft contains unexpected assets; refusing to replace them.');
+          }
+          NODE
+            gh release edit "$RELEASE_TAG" --draft --title "Repo Tray $RELEASE_TAG" \
+              --notes-file "$notes" --prerelease="$RELEASE_PRERELEASE"
+          elif grep -q 'HTTP 404' release/release-query-error.txt; then
+            gh release create "$RELEASE_TAG" --verify-tag --draft \
+              --target "$RELEASE_COMMIT" --title "Repo Tray $RELEASE_TAG" \
+              --notes-file "$notes" --prerelease="$RELEASE_PRERELEASE"
+          else
+            cat release/release-query-error.txt >&2
+            exit 1
+          fi
+
+          gh release upload "$RELEASE_TAG" release/assets/* --clobber
+          gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > release/uploaded-release.json
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const crypto = require('node:crypto');
+          const { execFileSync } = require('node:child_process');
+          const release = JSON.parse(fs.readFileSync('release/uploaded-release.json', 'utf8'));
+          const api = endpoint => JSON.parse(execFileSync('gh', ['api', 'repos/' + process.env.GH_REPO + '/' + endpoint], { encoding: 'utf8' }));
+          let tag = api('git/ref/tags/' + encodeURIComponent(process.env.RELEASE_TAG)).object;
+          for (let depth = 0; tag.type === 'tag' && depth < 10; depth++) tag = api('git/tags/' + tag.sha).object;
+          if (tag.type !== 'commit' || tag.sha !== process.env.RELEASE_COMMIT) {
+            throw new Error('The remote release tag moved after validation; refusing to publish.');
+          }
+          const directory = 'release/assets';
+          const files = fs.readdirSync(directory).sort();
+          const names = release.assets.map(asset => asset.name).sort();
+          if (!release.draft || release.tag_name !== process.env.RELEASE_TAG || JSON.stringify(names) !== JSON.stringify(files)) {
+            throw new Error('Uploaded release assets do not match the verified local files.');
+          }
+          for (const filename of files) {
+            const file = fs.readFileSync(path.join(directory, filename));
+            const asset = release.assets.find(item => item.name === filename);
+            const digest = 'sha256:' + crypto.createHash('sha256').update(file).digest('hex');
+            if (asset.state !== 'uploaded' || asset.size !== file.length || (asset.digest && asset.digest !== digest)) {
+              throw new Error('Uploaded asset validation failed: ' + filename);
+            }
+          }
+          NODE
+          latest=false
+          if [[ "$RELEASE_PRERELEASE" == "false" ]]; then latest=true; fi
+          gh release edit "$RELEASE_TAG" --draft=false \
+            --prerelease="$RELEASE_PRERELEASE" --latest="$latest"
+          gh release view "$RELEASE_TAG" --json url --jq '.url' >> "$GITHUB_STEP_SUMMARY"
