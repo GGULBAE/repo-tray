@@ -262,3 +262,145 @@ test('depth limit, nonexistent roots, and invalid inputs produce bounded useful 
   await assert.rejects(discoverRepositories({ roots: ['relative'] }), TypeError);
   await assert.rejects(discoverRepositories({ roots: [root], maxDepth: -1 }), TypeError);
 });
+
+test('explicit Homebrew installation roots and macOS Data aliases are excluded before filesystem access', { skip: process.platform === 'win32' }, async t => {
+  const calls = observeFilesystem(t);
+  const roots = ['/homebrew', '/opt/homebrew/Library/Taps/homebrew/homebrew-core', '/usr/local/Homebrew', '/usr/local/Cellar/tool', '/usr/local/Caskroom/tool', '/home/linuxbrew/.linuxbrew'];
+  roots.push(...roots.map(root => '/System/Volumes/Data' + root), '/OPT/HOMEBREW');
+  const result = await discoverRepositories({ roots, home: '/homefake', platform: 'darwin', mode: 'folder', environment: {} });
+  assert.deepEqual(result.repositories, []);
+  assert.equal(result.errorCount, 0);
+  assert.equal(result.skippedCount, roots.length);
+  assert.deepEqual(calls, []);
+});
+
+test('home tool roots and editor package stores cannot be opted into with explicit selection', async t => {
+  const home = '/homefake';
+  const roots = ['.homebrew', '.linuxbrew', '.nvm', '.pyenv', '.rbenv', '.asdf', '.sdkman', '.oh-my-zsh', '.oh-my-fish', '.oh-my-bash', '.zplug', '.zinit', '.vscode/extensions/plugin', '.cursor/extensions/plugin', '.local/share/nvim/lazy/plugin', '.local/share/nvim/site/pack/vendor', '.vim/plugged/plugin'].map(name => path.posix.join(home, name));
+  if (process.platform !== 'win32') roots.push('/System/Volumes/Data/homefake/.nvm/versions');
+  const calls = observeFilesystem(t);
+  const result = await discoverRepositories({ roots, home, platform: 'darwin', mode: 'folder', environment: {} });
+  assert.deepEqual(result.repositories, []);
+  assert.equal(result.errorCount, 0);
+  assert.equal(result.skippedCount, roots.length);
+  assert.deepEqual(calls, []);
+});
+
+test('Windows Scoop and Chocolatey installations on any drive are excluded before filesystem access', async t => {
+  const home = 'D:\\Users\\test';
+  const roots = [home + '\\scoop\\apps\\git', home + '\\SCOOP\\buckets\\main', 'C:\\scoop\\apps', 'E:\\Scoop\\buckets', 'C:\\ProgramData\\scoop', 'C:\\ProgramData\\Chocolatey\\lib', 'E:\\Chocolatey', 'F:\\custom-scoop\\buckets', 'G:\\custom-choco\\lib'];
+  const calls = observeFilesystem(t);
+  const result = await discoverRepositories({ roots, home, platform: 'win32', mode: 'folder', environment: { SCOOP_GLOBAL: 'F:\\custom-scoop', ChocolateyInstall: 'G:\\custom-choco' } });
+  assert.deepEqual(result.repositories, []);
+  assert.equal(result.errorCount, 0);
+  assert.equal(result.skippedCount, roots.length);
+  assert.deepEqual(calls, []);
+});
+
+test('explicit dependency and cache roots are excluded while Git metadata remains supported', async t => {
+  const home = '/homefake';
+  const roots = ['node_modules/package', '.cache/package', '.npm/package', '.pnpm-store/package', '.yarn/package', '.cargo/git/checkouts/package', '.cargo/registry/src/package', '.rustup/toolchains', '.gradle/caches', '.m2/repository', '.nuget/packages', '.venv/package', 'venv/package', '__pycache__', '.git'].map(name => path.posix.join(home, 'Project', name));
+  const calls = observeFilesystem(t);
+  const result = await discoverRepositories({ roots, home, platform: 'darwin', mode: 'folder', environment: {} });
+  assert.deepEqual(result.repositories, []);
+  assert.equal(result.errorCount, 0);
+  assert.equal(result.skippedCount, roots.length);
+  assert.deepEqual(calls, []);
+});
+
+test('ordinary contribution clones and similarly named nested projects remain discoverable', async t => {
+  const home = await rootFor(t);
+  const projects = ['Projects/homebrew', 'Projects/scoop', 'Projects/.nvm', 'Projects/homebrew-extra', 'Homebrew'].map(name => path.join(home, ...name.split('/')));
+  for (const project of projects) await repository(project);
+  await run('git', ['-C', projects[0], 'remote', 'add', 'origin', 'https://github.com/Homebrew/brew.git']);
+  const managed = path.join(home, '.nvm');
+  await repository(path.join(managed, 'installed'));
+  const calls = observeFilesystem(t, [managed]);
+  const result = await discoverRepositories({ roots: [home], home, mode: 'full', environment: {} });
+  assert.deepEqual(result.repositories.map(repo => repo.path).sort(), projects.sort());
+  assert.equal(result.errorCount, 0);
+  assert.equal(calls.some(call => within(call.target, managed)), false);
+});
+
+test('explicit user configuration and Codex worktree projects are not mistaken for tool installations', async t => {
+  const home = await rootFor(t);
+  const projects = ['.config/nvim', '.local/projects/custom-tool', '.codex/worktrees/project', 'Projects/.cargo'].map(name => path.join(home, ...name.split('/')));
+  for (const project of projects) await repository(project);
+  const result = await discoverRepositories({ roots: projects, home, mode: 'folder', environment: {} });
+  assert.deepEqual(result.repositories.map(repo => repo.path).sort(), projects.sort());
+  assert.equal(result.errorCount, 0);
+});
+
+test('custom installation prefixes are excluded in full and folder modes before touching their contents', async t => {
+  const home = await rootFor(t);
+  const safe = path.join(home, 'Projects', 'app');
+  const managed = ['brew-install', 'brew-repository', 'brew-cellar', 'scoop-install', 'scoop-global', 'choco-install'].map(name => path.join(home, 'Tools', name));
+  const names = ['HOMEBREW_PREFIX', 'HOMEBREW_REPOSITORY', 'HOMEBREW_CELLAR', 'SCOOP', 'SCOOP_GLOBAL', 'ChocolateyInstall'];
+  const environment = Object.fromEntries(names.map((name, index) => [name, managed[index]]));
+  await repository(safe);
+  for (const folder of managed) await repository(path.join(folder, 'installed'));
+  const calls = observeFilesystem(t, managed);
+  for (const mode of ['full', 'folder']) {
+    const result = await discoverRepositories({ roots: [home, ...managed], home, mode, environment });
+    assert.deepEqual(result.repositories.map(repo => repo.path), [safe]);
+    assert.equal(result.errorCount, 0);
+  }
+  if (process.platform !== 'win32') {
+    const alias = await discoverRepositories({ roots: ['/System/Volumes/Data' + managed[0]], home, platform: 'darwin', mode: 'folder', environment });
+    assert.equal(alias.scannedDirectories, 0);
+    assert.equal(alias.errorCount, 0);
+  }
+  assert.equal(calls.some(call => managed.some(folder => within(call.target, folder)) || call.target.startsWith('/System')), false);
+});
+
+test('invalid or overly broad installation environment values cannot hide user projects', async t => {
+  const home = await rootFor(t);
+  const project = path.join(home, 'Projects', 'app');
+  await repository(project);
+  const environment = { HOMEBREW_PREFIX: home, HOMEBREW_REPOSITORY: path.dirname(home), HOMEBREW_CELLAR: path.parse(home).root, SCOOP: 'relative/path', SCOOP_GLOBAL: '', ChocolateyInstall: null, NVM_DIR: home + '\0bad', PYENV_ROOT: ' ' + home, ASDF_DIR: 123 };
+  const result = await discoverRepositories({ roots: [home], home, mode: 'full', environment });
+  assert.deepEqual(result.repositories.map(repo => repo.path), [project]);
+  assert.equal(result.errorCount, 0);
+});
+
+test('Git metadata pointers cannot opt into a dependency checkout', async t => {
+  const home = await rootFor(t);
+  const dependency = path.join(home, 'node_modules', 'package');
+  const project = path.join(home, 'metadata-pointer');
+  await repository(dependency);
+  await fs.mkdir(project);
+  await fs.writeFile(path.join(project, '.git'), `gitdir: ${path.join(dependency, '.git')}\n`);
+  const calls = observeFilesystem(t, [dependency]);
+  const result = await discoverRepositories({ roots: [home, project], home, mode: 'folder', environment: {} });
+  assert.deepEqual(result.repositories, []);
+  assert.equal(result.errorCount, 0);
+  assert.equal(calls.some(call => within(call.target, dependency)), false);
+});
+
+test('explicit aliases and Git metadata pointers cannot enter custom installations', { skip: process.platform === 'win32' }, async t => {
+  const home = await rootFor(t);
+  const managed = path.join(home, 'Tools', 'brew');
+  const source = path.join(managed, 'repository');
+  await repository(source);
+  const alias = path.join(home, 'installed-alias');
+  const metadataAlias = path.join(home, 'metadata-alias');
+  await fs.symlink(source, alias, 'dir');
+  await fs.symlink(path.join(source, '.git'), metadataAlias, 'dir');
+  const direct = path.join(home, 'direct');
+  const indirect = path.join(home, 'indirect');
+  const common = path.join(home, 'common-pointer');
+  const objects = path.join(home, 'objects-pointer');
+  for (const folder of [direct, indirect]) await fs.mkdir(folder);
+  await fs.writeFile(path.join(direct, '.git'), `gitdir: ${path.join(source, '.git')}\n`);
+  await fs.writeFile(path.join(indirect, '.git'), `gitdir: ${metadataAlias}\n`);
+  await repository(common);
+  await fs.writeFile(path.join(common, '.git', 'commondir'), path.join(source, '.git') + '\n');
+  await repository(objects);
+  await fs.rm(path.join(objects, '.git', 'objects'), { recursive: true, force: true });
+  await fs.symlink(path.join(source, '.git', 'objects'), path.join(objects, '.git', 'objects'), 'dir');
+  const calls = observeFilesystem(t, [managed]);
+  const result = await discoverRepositories({ roots: [home, alias], home, mode: 'folder', environment: { HOMEBREW_PREFIX: managed } });
+  assert.deepEqual(result.repositories, []);
+  assert.equal(result.errorCount, 0);
+  assert.equal(calls.some(call => within(call.target, managed)), false);
+});

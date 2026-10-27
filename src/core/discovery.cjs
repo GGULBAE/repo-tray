@@ -5,6 +5,10 @@ const path = require('node:path');
 const os = require('node:os');
 
 const DEPENDENCY_NAMES = new Set(['.git', '.hg', '.svn', 'node_modules', '.venv', 'venv', '__pycache__']);
+const CACHE_NAMES = new Set(['.cache', '.npm', '.pnpm-store', '.yarn', '.bun', '.rustup', '.gradle', '.m2', '.nuget', '.dotnet']);
+const HOME_TOOL_NAMES = ['.homebrew', '.linuxbrew', '.nvm', '.pyenv', '.rbenv', '.asdf', '.sdkman', '.oh-my-zsh', '.oh-my-fish', '.oh-my-bash', '.zplug', '.zinit', '.nodenv', '.jenv', '.rvm', '.volta'];
+const HOME_TOOL_PATHS = ['.vscode/extensions', '.vscode-insiders/extensions', '.cursor/extensions', '.vim/pack', '.vim/plugged', '.local/share/nvim/lazy', '.local/share/nvim/site/pack'];
+const INSTALL_ENVIRONMENT_KEYS = ['HOMEBREW_PREFIX', 'HOMEBREW_REPOSITORY', 'HOMEBREW_CELLAR', 'SCOOP', 'SCOOP_GLOBAL', 'ChocolateyInstall', 'NVM_DIR', 'PYENV_ROOT', 'RBENV_ROOT', 'ASDF_DIR', 'ASDF_DATA_DIR', 'SDKMAN_DIR', 'ZPLUG_HOME', 'VOLTA_HOME'];
 const PRIVATE_NAMES = new Set(['desktop', 'documents', 'downloads', 'library', 'pictures', 'movies', 'music', 'photos', 'videos', 'appdata']);
 const HIDDEN_APP_NAMES = new Set(['.cache', '.config', '.local', '.npm', '.pnpm-store', '.yarn', '.bun', '.cargo', '.rustup', '.gradle', '.m2', '.nuget', '.dotnet', '.ollama', '.docker', '.codex', '.claude', '.cursor', '.vscode', '.ssh', '.aws', '.azure', '.kube', '.gnupg', '.trash', '.trashes']);
 const SYSTEM_NAMES = new Set(['$recycle.bin', 'system volume information', 'windows', 'program files', 'program files (x86)', 'programdata', 'applications']);
@@ -27,7 +31,7 @@ async function getFullScanRoots({ home = os.homedir() } = {}) {
   return typeof home === 'string' && home && !home.includes('\0') ? [home] : [];
 }
 
-async function discoverRepositories({ roots, maxDepth = 30, onFound = () => {}, onProgress = () => {}, signal, mode = 'folder', home = os.homedir(), platform = process.platform, deniedPaths = [] } = {}) {
+async function discoverRepositories({ roots, maxDepth = 30, onFound = () => {}, onProgress = () => {}, signal, mode = 'folder', home = os.homedir(), platform = process.platform, deniedPaths = [], environment = process.env } = {}) {
   const paths = platform === 'win32' && Array.isArray(roots) && roots.some(root => typeof root === 'string' && /^(?:[a-z]:[\\/]|\\\\)/i.test(root)) ? path.win32 : path;
   if (!Array.isArray(roots) || !roots.length || roots.some(root => typeof root !== 'string' || !paths.isAbsolute(root) || root.includes('\0'))) throw new TypeError('검색할 절대 경로를 하나 이상 지정하세요.');
   if (!Number.isInteger(maxDepth) || maxDepth < 0 || maxDepth > 100) throw new TypeError('검색 깊이는 0~100의 정수여야 합니다.');
@@ -46,6 +50,32 @@ async function discoverRepositories({ roots, maxDepth = 30, onFound = () => {}, 
   const allowedRoots = [...explicitRoots];
   const userHome = normalize(home);
   const homeParent = paths.dirname(userHome);
+  // Installation roots are excluded even when explicitly picked. Match known
+  // locations, never repository names or remotes: ~/Projects/homebrew is a project.
+  const installationRoots = [...HOME_TOOL_NAMES, ...HOME_TOOL_PATHS].map(name => paths.join(userHome, ...name.split('/')));
+  if (paths === path.win32) {
+    installationRoots.push(paths.join(userHome, 'scoop'));
+  } else {
+    installationRoots.push('/homebrew', '/opt/homebrew', '/usr/local/Homebrew', '/usr/local/Cellar', '/usr/local/Caskroom', '/home/linuxbrew/.linuxbrew');
+  }
+  const installationKey = target => {
+    let key = normalize(target);
+    if (platform === 'darwin') key = key.replace(/^\/System\/Volumes\/Data(?=\/|$)/i, '') || '/';
+    return ['darwin', 'win32'].includes(platform) ? key.toLowerCase() : key;
+  };
+  const insideInstallation = (target, root) => {
+    const relative = paths.relative(installationKey(root), installationKey(target));
+    return relative === '' || (!relative.startsWith('..' + paths.sep) && relative !== '..' && !paths.isAbsolute(relative));
+  };
+  for (const name of INSTALL_ENVIRONMENT_KEYS) {
+    const value = environment?.[name];
+    if (typeof value !== 'string' || !value || value.trim() !== value || /[\x00-\x1f]/.test(value) || !paths.isAbsolute(value)) continue;
+    // Ignore malformed/broad configuration that would hide the home or a drive.
+    if (paths === path.win32 && !/^(?:[a-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)/i.test(value)) continue;
+    const root = normalize(value);
+    if (root === paths.parse(root).root || insideInstallation(userHome, root)) continue;
+    installationRoots.push(root);
+  }
   const denied = new Map();
   for (const value of Array.isArray(deniedPaths) ? deniedPaths : []) {
     if (typeof value === 'string' && paths.isAbsolute(value) && !value.includes('\0') && denied.size < 500) denied.set(keyFor(value), normalize(value));
@@ -78,6 +108,12 @@ async function discoverRepositories({ roots, maxDepth = 30, onFound = () => {}, 
   // boundary merely to learn whether the OS would let us access it.
   function allowed(target, { explicit = false, metadata = false } = {}) {
     target = normalize(target);
+    if (paths === path.win32 && /^[a-z]:\\(?:scoop|chocolatey|programdata\\(?:scoop|chocolatey))(?:\\|$)/i.test(target)) return skip(target);
+    if (installationRoots.some(root => insideInstallation(target, root))) return skip(target);
+    const parts = segments(target).map(name => name.toLowerCase());
+    if (parts.some((name, index) => CACHE_NAMES.has(name) ||
+      (name === '.cargo' && ['git', 'registry'].includes(parts[index + 1])) ||
+      (DEPENDENCY_NAMES.has(name) && !(metadata && name === '.git')))) return skip(target);
     if (mode === 'folder' && explicit) return true;
     if (inRememberedDeniedPath(target)) return skip(target);
     if (mode === 'full') {

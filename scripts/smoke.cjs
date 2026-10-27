@@ -24,6 +24,7 @@ const writeCommit = async (cwd, file, content, subject) => {
   const writer = path.join(root, 'author');
   const reader = path.join(root, 'studio-web');
   const linked = path.join(root, 'studio-web-feature');
+  const managed = path.join(root, '.nvm');
   await fs.mkdir(remote);
   await git(remote, 'init', '--bare', '--initial-branch=main');
   await git(root, 'clone', remote, writer);
@@ -37,6 +38,7 @@ const writeCommit = async (cwd, file, content, subject) => {
   await git(reader, 'config', 'user.email', 'test@example.invalid');
   await git(reader, 'config', 'commit.gpgSign', 'false');
   await git(reader, 'worktree', 'add', '-b', 'feature', linked);
+  await git(root, 'clone', remote, managed);
   env.REPO_TRAY_USER_DATA = path.join(root, 'app-data');
   env.REPO_TRAY_TEST_HOME = root;
   desktop = await _electron.launch({
@@ -72,6 +74,12 @@ const writeCommit = async (cwd, file, content, subject) => {
   const found = scanned.scan.found.find(repo => repo.name === 'studio-web');
   assert.ok(found);
   assert.ok(scanned.scan.found.some(repo => repo.bare));
+  assert.ok(!scanned.scan.found.some(repo => repo.path === managed), 'installed tools do not appear as user projects');
+  const managedError = await page.evaluate(async repoPath => {
+    try { await window.repoTray.addRepositories({ paths: [repoPath], intervalMinutes: 60 }); }
+    catch (error) { return error.message; }
+  }, managed);
+  assert.match(managedError, /탐색 결과/);
   const linkedFound = scanned.scan.found.find(repo => repo.path === linked);
   assert.equal(linkedFound.groupKey, found.groupKey);
   assert.notEqual(scanned.scan.found.find(repo => repo.path === writer).groupKey, found.groupKey);
@@ -181,8 +189,15 @@ const writeCommit = async (cwd, file, content, subject) => {
   const upgraded = await upgradedPage.evaluate(() => window.repoTray.getState());
   assert.equal(upgraded.repositories.length, 1, 'legacy main checkout excludes a separately scanned linked checkout');
   assert.equal(upgraded.repositories[0].groupKey, found.groupKey);
+  await desktop.evaluate(({ dialog }, managedRoot) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [managedRoot] }); }, managed);
+  await upgradedPage.evaluate(() => window.repoTray.scan({ mode: 'folder' }));
+  const managedScan = await waitForState(state => !state.scan.running, upgradedPage);
+  assert.deepEqual(managedScan.scan.found, [], 'explicitly selecting an installed tool also excludes it');
+  assert.ok(managedScan.scan.skippedCount > 0);
+  assert.equal(managedScan.repositories.length, 1, 'discovery does not remove existing monitoring settings');
+  assert.equal(await fs.readFile(path.join(managed, 'hello.txt'), 'utf8'), 'initial\n');
   await desktop.close(); desktop = null;
-  console.log('Desktop smoke passed: grouped discovery → duplicate/worktree registration protection → fetch/red tray → user sync → dirty-work protection → settings → hide/reopen → persistence.');
+  console.log('Desktop smoke passed: user-project discovery and tool exclusions → duplicate/worktree registration protection → fetch/red tray → user sync → dirty-work protection → settings → hide/reopen → persistence.');
 })().catch(error => { console.error(error); process.exitCode = 1; }).finally(async () => {
   if (desktop) await desktop.close().catch(() => {});
   if (root) await fs.rm(root, { recursive: true, force: true });

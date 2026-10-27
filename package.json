@@ -1,11 +1,16 @@
 {
   "name": "repo-tray",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Quiet Git monitoring for your menu bar and system tray",
   "author": "Repo Tray",
   "homepage": "https://github.com/GGULBAE/repo-tray#readme",
-  "repository": { "type": "git", "url": "https://github.com/GGULBAE/repo-tray.git" },
-  "bugs": { "url": "https://github.com/GGULBAE/repo-tray/issues" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GGULBAE/repo-tray.git"
+  },
+  "bugs": {
+    "url": "https://github.com/GGULBAE/repo-tray/issues"
+  },
   "private": true,
   "license": "MIT",
   "main": "src/main.cjs",
