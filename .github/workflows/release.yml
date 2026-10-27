@@ -3,12 +3,18 @@ name: Release desktop apps
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build or resume (for example v0.1.1)
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: desktop-release-${{ github.ref }}
+  group: desktop-release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 defaults:
@@ -29,6 +35,7 @@ jobs:
         id: checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
           persist-credentials: false
       - name: Set up Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -38,7 +45,7 @@ jobs:
       - name: Require a SemVer tag matching package.json
         id: version
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           node <<'NODE'
           const fs = require('node:fs');
@@ -118,7 +125,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
       RELEASE_VERSION: ${{ needs.validate.outputs.version }}
       RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
       RELEASE_PRERELEASE: ${{ needs.validate.outputs.prerelease }}
@@ -161,7 +168,28 @@ jobs:
           fi
           printf '\n\n%s\n' "$marker" >> "$notes"
 
-          if gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > release/existing-release.json 2> release/release-query-error.txt; then
+          # The authenticated list includes drafts, unlike the releases/tags endpoint.
+          lookup_release() {
+            gh api --paginate --slurp "repos/$GH_REPO/releases?per_page=100" > release/release-list.json || return
+            node <<'NODE'
+          const fs = require('node:fs');
+          const pages = JSON.parse(fs.readFileSync('release/release-list.json', 'utf8'));
+          if (!Array.isArray(pages) || pages.some(page => !Array.isArray(page))) {
+            throw new Error('Unexpected release-list response.');
+          }
+          const matches = pages.flat().filter(release => release.tag_name === process.env.RELEASE_TAG);
+          if (matches.length > 1) throw new Error('Multiple releases match the selected tag.');
+          fs.rmSync('release/existing-release.json', { force: true });
+          if (matches.length) {
+            const release = matches[0];
+            if (!Number.isSafeInteger(release.id) || release.id <= 0) throw new Error('Invalid release ID.');
+            fs.writeFileSync('release/existing-release.json', JSON.stringify(release));
+            process.stdout.write(String(release.id));
+          }
+          NODE
+          }
+          release_id="$(lookup_release)"
+          if [[ -n "$release_id" ]]; then
             node <<'NODE'
           const fs = require('node:fs');
           const release = JSON.parse(fs.readFileSync('release/existing-release.json', 'utf8'));
@@ -179,17 +207,19 @@ jobs:
           NODE
             gh release edit "$RELEASE_TAG" --draft --title "Repo Tray $RELEASE_TAG" \
               --notes-file "$notes" --prerelease="$RELEASE_PRERELEASE"
-          elif grep -q 'HTTP 404' release/release-query-error.txt; then
+          else
             gh release create "$RELEASE_TAG" --verify-tag --draft \
               --target "$RELEASE_COMMIT" --title "Repo Tray $RELEASE_TAG" \
               --notes-file "$notes" --prerelease="$RELEASE_PRERELEASE"
-          else
-            cat release/release-query-error.txt >&2
-            exit 1
+            release_id="$(lookup_release)"
+            if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+              echo "The newly created draft could not be found." >&2
+              exit 1
+            fi
           fi
 
           gh release upload "$RELEASE_TAG" release/assets/* --clobber
-          gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > release/uploaded-release.json
+          gh api "repos/$GH_REPO/releases/$release_id" > release/uploaded-release.json
           node <<'NODE'
           const fs = require('node:fs');
           const path = require('node:path');
