@@ -211,9 +211,15 @@ jobs:
             gh release create "$RELEASE_TAG" --verify-tag --draft \
               --target "$RELEASE_COMMIT" --title "Repo Tray $RELEASE_TAG" \
               --notes-file "$notes" --prerelease="$RELEASE_PRERELEASE"
-            release_id="$(lookup_release)"
+            # A newly created draft may take a moment to appear in the list.
+            # Retry reads only; creating again could leave duplicate drafts.
+            for delay in 0 1 2 4 8 10 10; do
+              if (( delay > 0 )); then sleep "$delay"; fi
+              release_id="$(lookup_release)"
+              if [[ -n "$release_id" ]]; then break; fi
+            done
             if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
-              echo "The newly created draft could not be found." >&2
+              echo "The new draft is not visible yet. It was kept; rerun this workflow to resume it." >&2
               exit 1
             fi
           fi
