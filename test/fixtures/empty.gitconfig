@@ -1,0 +1,2 @@
+# Keep fixture Git commands independent of the host's global configuration.
+# A regular file works with Git for Windows, unlike Node's os.devNull path.

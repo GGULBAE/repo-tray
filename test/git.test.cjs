@@ -13,7 +13,7 @@ const { inspectRepository, getRepositoryGroup, fetchRepository, synchronizeRepos
 // Fixture commands and the Git engine must use the same isolated configuration.
 // In particular, a Windows host's core.autocrlf must not change fixture contents.
 process.env.GIT_CONFIG_NOSYSTEM = '1';
-process.env.GIT_CONFIG_GLOBAL = os.devNull;
+process.env.GIT_CONFIG_GLOBAL = path.join(__dirname, 'fixtures', 'empty.gitconfig');
 process.env.GIT_TERMINAL_PROMPT = '0';
 const git = async (directory, ...args) => (await run('git', ['-C', directory, ...args])).stdout.trim();
 

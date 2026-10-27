@@ -1,5 +1,7 @@
 # Repo Tray
 
+[![Desktop CI](https://github.com/GGULBAE/repo-tray/actions/workflows/ci.yml/badge.svg)](https://github.com/GGULBAE/repo-tray/actions/workflows/ci.yml)
+
 Quiet Git monitoring for the macOS menu bar and Windows system tray.
 
 여러 컴퓨터에서 작업할 때, 다른 곳에서 push한 변경을 놓치지 않도록 알려 주는 데스크탑 앱입니다. 등록한 Git 저장소를 주기적으로 확인하고 원격 변경이 있으면 **트레이 아이콘을 빨간색으로 표시**합니다. 작업 파일은 사용자가 **동기화**를 누를 때만 변경합니다.

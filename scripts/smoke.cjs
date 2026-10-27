@@ -8,7 +8,7 @@ const { execFile } = require('node:child_process');
 const { _electron } = require('playwright');
 const run = promisify(execFile);
 const project = path.resolve(__dirname, '..');
-const env = { ...process.env, REPO_TRAY_SMOKE_TEST: '1', GIT_CONFIG_GLOBAL: os.devNull, GIT_CONFIG_NOSYSTEM: '1' };
+const env = { ...process.env, REPO_TRAY_SMOKE_TEST: '1', GIT_CONFIG_GLOBAL: path.join(project, 'test', 'fixtures', 'empty.gitconfig'), GIT_CONFIG_NOSYSTEM: '1' };
 delete env.ELECTRON_RUN_AS_NODE;
 let desktop;
 let root;
